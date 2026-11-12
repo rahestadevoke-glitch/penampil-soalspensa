@@ -671,7 +671,7 @@ body::after {
       <div class="splash-status" id="splash-status">Mempersiapkan sistem...</div>
     </div>
   </div>
-  <div class="splash-dev">Sistem Ujian Digital © 2026</div>
+  <div class="splash-dev">Sistem Ujian Digital © 2025</div>
 </div>
 
 <div id="room-loading-overlay">
@@ -871,7 +871,22 @@ body::after {
 
 <script>
 /* GANTI dengan URL Web App Apps Script Anda (Deploy → New deployment → Web app) */
-const GAS_URL_SOAL    = 'https://script.google.com/macros/s/AKfycbzzhNg4lbQtSAOprgmPkzqn48SJ1JMK_jwRmyEs_sRqILh9P4t2lV-IbOAvHGYyRfq5/exec';
+/* ═══════════════ DAFTAR SERVER SOAL (FAILOVER OTOMATIS) ═══════════════
+   Urutan = prioritas. Jika server aktif penuh (kuota habis / error /
+   timeout), sistem otomatis pindah ke server berikutnya, lalu kembali
+   ke server 1 setelah semua dicoba. Server yang sedang berhasil
+   diingat di sessionStorage agar request berikutnya langsung ke sana.
+   PENTING: semua server harus berisi script & spreadsheet yang sama.
+   ═══════════════════════════════════════════════════════════════════ */
+const GAS_URLS_SOAL = [
+  'https://script.google.com/macros/s/AKfycbzzhNg4lbQtSAOprgmPkzqn48SJ1JMK_jwRmyEs_sRqILh9P4t2lV-IbOAvHGYyRfq5/exec', // server 1
+  'https://script.google.com/macros/s/AKfycbxx9BUZO9P8w4CC-fnmzQcNfpytyAx2gImxOcy9rRaj4ZJLf6AjwpSTxjW-iBew3__f_w/exec', // server 2
+  'https://script.google.com/macros/s/AKfycbx4k1XnValpmxSnSShV_Q7Z9up8pM5B4uVqqVtqqF-mGgEXbtRdS7R9hJonBJ6HpbuK/exec', // server 3
+  'https://script.google.com/macros/s/AKfycbzqvWCD28Q5L-7NYIsahgFOLur-iIZd0292-BSJTg_k7xbvPQ-l9ukgFjX1zU_VMSPamA/exec'  // server 4
+];
+let gasIdxSoal = 0;
+try { const t = parseInt(sessionStorage.getItem('gasIdxSoal'), 10); if (t >= 0 && t < GAS_URLS_SOAL.length) gasIdxSoal = t; } catch (e) {}
+const GAS_URL_SOAL = GAS_URLS_SOAL[0]; /* dipertahankan sebagai penanda default pool soal */
 const GAS_URL_JAWABAN = 'https://script.google.com/macros/s/AKfycbyktcRU3b8pCVaE-YHTGrys6asPGTiNOX4PrWJlU-x1beJ7YgubssKAGkzW_yCm5-UsCw/exec';
 
 /* ═══════════════ ROUTING JAWABAN PER KELAS ═══════════════
@@ -1021,14 +1036,51 @@ let timerSisaDetik = 15, timerCekPeserta = null;
 let kodeMapelAktif = '', mataPelajaranAktif = '', passwordSelesaiAktif = '';
 
 /* ═══════════════ GAS FETCH ═══════════════ */
-async function gasGet(action, params = {}, baseUrl = GAS_URL_SOAL) {
+/* Deteksi error karena kuota/server penuh (bukan error logika aplikasi) */
+function gasErrKuota(data) {
+  const msg = JSON.stringify(data || '').toLowerCase();
+  return /quota|too many times|service invoked|exceeded|rate limit|try again later|server error/.test(msg);
+}
+
+async function gasFetchSatu(baseUrl, qs, timeoutMs) {
   const controller = new AbortController();
-  const tid = setTimeout(() => controller.abort(), 15000);
+  const tid = setTimeout(() => controller.abort(), timeoutMs);
   try {
-    const qs  = new URLSearchParams({ action, ...params }).toString();
     const res = await fetch(`${baseUrl}?${qs}`, { signal: controller.signal });
-    return await res.json();
+    if (res.status === 429 || res.status >= 500) throw new Error('HTTP ' + res.status);
+    const txt = await res.text();
+    let data;
+    try { data = JSON.parse(txt); }                      // HTML error page (kuota habis) → gagal parse
+    catch (e) { throw new Error('Respons bukan JSON (server kemungkinan penuh)'); }
+    if (data && (data.success === false || data.error) && gasErrKuota(data)) throw new Error('Kuota server habis');
+    return data;
   } finally { clearTimeout(tid); }
+}
+
+async function gasGet(action, params = {}, baseUrl = GAS_URL_SOAL) {
+  const qs = new URLSearchParams({ action, ...params }).toString();
+
+  /* URL khusus (mis. server jawaban per kelas) → tanpa failover soal */
+  if (baseUrl !== GAS_URL_SOAL) return await gasFetchSatu(baseUrl, qs, 15000);
+
+  /* Pool server soal → coba berurutan mulai dari server aktif */
+  let lastErr;
+  for (let n = 0; n < GAS_URLS_SOAL.length; n++) {
+    const idx = (gasIdxSoal + n) % GAS_URLS_SOAL.length;
+    try {
+      const data = await gasFetchSatu(GAS_URLS_SOAL[idx], qs, 15000);
+      if (idx !== gasIdxSoal) {
+        gasIdxSoal = idx;
+        try { sessionStorage.setItem('gasIdxSoal', String(idx)); } catch (e) {}
+        console.warn('[GAS] Pindah ke server ' + (idx + 1));
+      }
+      return data;
+    } catch (err) {
+      lastErr = err;
+      console.warn('[GAS] Server ' + (idx + 1) + ' gagal (' + action + '): ' + err.message);
+    }
+  }
+  throw lastErr || new Error('Semua server soal tidak dapat dihubungi');
 }
 
 /* ═══════════════ SPLASH ═══════════════ */
